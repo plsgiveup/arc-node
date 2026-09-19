@@ -37,6 +37,8 @@ tonic-build = { workspace = true }
 
 [dev-dependencies]
 rand = { workspace = true }
+tokio = { workspace = true, features = ["macros", "net", "rt-multi-thread", "sync"] }
+tokio-stream = { workspace = true, features = ["net"] }
 
 [lints]
 workspace = true
