@@ -261,6 +261,7 @@ thiserror = { version = "2.0.0", default-features = false }
 
 # tokio
 tokio = { version = "1.44.2", default-features = false }
+tokio-stream = { version = "0.1.18", default-features = false }
 tokio-tungstenite = { version = "0.26.2", features = ["rustls-tls-native-roots"] }
 tokio-util = { version = "0.7.4", features = ["codec"] }
 

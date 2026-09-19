@@ -33,7 +33,9 @@ fn main() {
     std::fs::write(&fd_path, fd.encode_to_vec()).expect("Failed to write file descriptor set");
 
     tonic_build::configure()
-        .build_server(false)
+        // Generate the server bindings as well so localhost-only end-to-end
+        // tests exercise the real SignerService wire contract.
+        .build_server(true)
         .build_client(true)
         .file_descriptor_set_path(fd_path)
         .skip_protoc_run()
