@@ -1,0 +1,439 @@
+From 2f74d5f321dab853d4517e84a2e8153c5955e51a Mon Sep 17 00:00:00 2001
+From: Codex <codex@openai.com>
+Date: Sat, 19 Sep 2026 11:29:59 +0000
+Subject: [PATCH] remote-signer: enable server codegen, add localhost E2E
+ signing test, and document trust boundary
+
+### Motivation
+
+- Provide an end-to-end regression that exercises the real `SignerService` wire contract so tests run against the same protobuf/tonic bindings the production client uses.
+- Ensure the build produces server bindings so local-only tests can mount a plaintext gRPC signer and verify signing/verification behavior.
+- Capture the security analysis and reproducible vectors for the remote-signer trust boundary in a checked-in document.
+
+### Description
+
+- Enable generation of server bindings in the proto build pipeline by changing `tonic_build::configure().build_server(false)` to `.build_server(true)` and add a comment explaining the rationale in `crates/remote-signer/build.rs`.
+- Add `tokio-stream` to workspace `Cargo.toml` and to `crates/remote-signer` dev-dependencies and update `Cargo.lock` accordingly so the test can serve gRPC with a `TcpListener` stream.
+- Add a local-only `SignerService` test implementation and an async test `localhost_signer_accepts_and_verifies_conflicting_canonical_votes` in `crates/remote-signer/src/provider.rs` that starts a plaintext SignerService on localhost, uses the production gRPC client (`RemoteSigningProvider`) to sign two conflicting precommits and a proposal, and verifies the signatures with the production verifier.
+- Add `docs/security/remote-signer-trust-boundary.md` containing a detailed call-chain analysis, reproducible canonical vectors, and reproduction instructions.
+
+### Testing
+
+- Ran `cargo test -p arc-remote-signer -- --nocapture` which executed the new `tokio::test` E2E test along with existing unit tests and they completed successfully.
+- The build step that generates protobuf bindings was exercised by the tests and succeeded (server and client stubs generated without errors).
+---
+ Cargo.lock                                    |   1 +
+ Cargo.toml                                    |   1 +
+ crates/remote-signer/Cargo.toml               |   2 +
+ crates/remote-signer/build.rs                 |   4 +-
+ crates/remote-signer/src/provider.rs          | 175 ++++++++++++++++++
+ docs/security/remote-signer-trust-boundary.md | 147 +++++++++++++++
+ 6 files changed, 329 insertions(+), 1 deletion(-)
+ create mode 100644 docs/security/remote-signer-trust-boundary.md
+
+diff --git a/Cargo.lock b/Cargo.lock
+index 560acdd..4f5155d 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -2050,6 +2050,7 @@ dependencies = [
+  "rand 0.8.5",
+  "thiserror 2.0.18",
+  "tokio",
++ "tokio-stream",
+  "tonic 0.12.3",
+  "tonic-build",
+  "tracing",
+diff --git a/Cargo.toml b/Cargo.toml
+index 6d50898..300416b 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -261,6 +261,7 @@ thiserror = { version = "2.0.0", default-features = false }
+ 
+ # tokio
+ tokio = { version = "1.44.2", default-features = false }
++tokio-stream = { version = "0.1.18", default-features = false }
+ tokio-tungstenite = { version = "0.26.2", features = ["rustls-tls-native-roots"] }
+ tokio-util = { version = "0.7.4", features = ["codec"] }
+ 
+diff --git a/crates/remote-signer/Cargo.toml b/crates/remote-signer/Cargo.toml
+index 6ce4070..b60d52c 100644
+--- a/crates/remote-signer/Cargo.toml
++++ b/crates/remote-signer/Cargo.toml
+@@ -37,6 +37,8 @@ tonic-build = { workspace = true }
+ 
+ [dev-dependencies]
+ rand = { workspace = true }
++tokio = { workspace = true, features = ["macros", "net", "rt-multi-thread", "sync"] }
++tokio-stream = { workspace = true, features = ["net"] }
+ 
+ [lints]
+ workspace = true
+diff --git a/crates/remote-signer/build.rs b/crates/remote-signer/build.rs
+index e8b37db..fa2e8f2 100644
+--- a/crates/remote-signer/build.rs
++++ b/crates/remote-signer/build.rs
+@@ -33,7 +33,9 @@ fn main() {
+     std::fs::write(&fd_path, fd.encode_to_vec()).expect("Failed to write file descriptor set");
+ 
+     tonic_build::configure()
+-        .build_server(false)
++        // Generate the server bindings as well so localhost-only end-to-end
++        // tests exercise the real SignerService wire contract.
++        .build_server(true)
+         .build_client(true)
+         .file_descriptor_set_path(fd_path)
+         .skip_protoc_run()
+diff --git a/crates/remote-signer/src/provider.rs b/crates/remote-signer/src/provider.rs
+index 038d607..9c71bbe 100644
+--- a/crates/remote-signer/src/provider.rs
++++ b/crates/remote-signer/src/provider.rs
+@@ -253,11 +253,50 @@ impl SigningProvider<ArcContext> for RemoteSigningProvider {
+ 
+ #[cfg(test)]
+ mod unit_tests {
++    use std::sync::Arc;
++
+     use arc_consensus_types::signing::PrivateKey;
+     use arc_consensus_types::{Address, BlockHash, Height, Round, Value, ValueId};
+     use malachitebft_core_types::{NilOrVal, VoteType};
++    use tokio::net::TcpListener;
++    use tokio::sync::oneshot;
++    use tokio_stream::wrappers::TcpListenerStream;
++    use tonic::{Request, Response, Status};
+ 
+     use super::*;
++    use crate::client::proto::signer_service_server::{SignerService, SignerServiceServer};
++    use crate::client::proto::{PublicKeyRequest, PublicKeyResponse, SignRequest, SignResponse};
++
++    /// Local-only implementation of the arc-remote-signer SignerService wire
++    /// contract. Like the reviewed signer implementation, it signs the request
++    /// message verbatim and performs no authentication or consensus parsing.
++    struct LocalSignerService {
++        private_key: Arc<PrivateKey>,
++    }
++
++    #[tonic::async_trait]
++    impl SignerService for LocalSignerService {
++        async fn public_key(
++            &self,
++            request: Request<PublicKeyRequest>,
++        ) -> Result<Response<PublicKeyResponse>, Status> {
++            assert!(request.metadata().get("authorization").is_none());
++            Ok(Response::new(PublicKeyResponse {
++                public_key: self.private_key.public_key().as_bytes().to_vec(),
++            }))
++        }
++
++        async fn sign(
++            &self,
++            request: Request<SignRequest>,
++        ) -> Result<Response<SignResponse>, Status> {
++            assert!(request.metadata().get("authorization").is_none());
++            let signature = self.private_key.sign(&request.into_inner().message);
++            Ok(Response::new(SignResponse {
++                signature: signature.to_bytes().to_vec(),
++            }))
++        }
++    }
+ 
+     #[test]
+     fn test_bytes_to_signature_valid_length() {
+@@ -315,6 +354,142 @@ mod unit_tests {
+         let bad_sig = ConsensusSignature::from_bytes(bad_sig_bytes);
+         assert!(public_key.verify(&vote_bytes, &bad_sig).is_err());
+     }
++
++    /// End-to-end regression vector for the remote-signer trust boundary.
++    ///
++    /// The remote signer receives these SSZ bytes verbatim.  In particular, no
++    /// chain identifier or request-specific domain separator is added by the
++    /// provider. This test starts a plaintext, unauthenticated SignerService on
++    /// an ephemeral localhost port, then uses the production gRPC client and
++    /// provider to sign and verify two conflicting precommits.
++    #[tokio::test]
++    async fn localhost_signer_accepts_and_verifies_conflicting_canonical_votes() {
++        let private_key = Arc::new(PrivateKey::from([0x42; 32]));
++        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
++        let listen_address = listener.local_addr().unwrap();
++        let (shutdown_tx, shutdown_rx) = oneshot::channel();
++        let server = tonic::transport::Server::builder()
++            .add_service(SignerServiceServer::new(LocalSignerService {
++                private_key: Arc::clone(&private_key),
++            }))
++            .serve_with_incoming_shutdown(TcpListenerStream::new(listener), async {
++                let _ = shutdown_rx.await;
++            });
++        let server_task = tokio::spawn(server);
++
++        let endpoint = format!("http://{listen_address}");
++        let provider = RemoteSigningProvider::new(RemoteSigningConfig::new(endpoint.clone()))
++            .await
++            .unwrap();
++        let public_key = provider.public_key().await.unwrap();
++        let validator_address = Address::from_public_key(&public_key);
++        let make_vote = |block_byte| {
++            Vote::new_precommit(
++                Height::new(42),
++                Round::new(7),
++                NilOrVal::Val(ValueId::new(BlockHash::new([block_byte; 32]))),
++                validator_address,
++            )
++        };
++
++        let vote_a = make_vote(0xaa);
++        let vote_b = make_vote(0xbb);
++        let bytes_a = vote_a.to_sign_bytes();
++        let bytes_b = vote_b.to_sign_bytes();
++        let signed_vote_a = provider.sign_vote(vote_a).await.unwrap();
++        let signed_vote_b = provider.sign_vote(vote_b).await.unwrap();
++        let signature_a = &signed_vote_a.signature;
++        let signature_b = &signed_vote_b.signature;
++        let proposal = Proposal::new(
++            Height::new(42),
++            Round::new(7),
++            Value::new(BlockHash::new([0xcc; 32])),
++            Round::Nil,
++            validator_address,
++        );
++        let proposal_bytes = proposal.to_sign_bytes();
++        let signed_proposal = provider.sign_proposal(proposal).await.unwrap();
++        let proposal_signature = &signed_proposal.signature;
++
++        eprintln!("listen_address={listen_address}");
++        eprintln!("transport=plaintext_h2c auth=none endpoint={endpoint}");
++        eprintln!("public_key={}", hex::encode(public_key.as_bytes()));
++        eprintln!(
++            "validator_address={}",
++            hex::encode(validator_address.into_inner())
++        );
++        eprintln!("vote_a={}", hex::encode(&bytes_a));
++        eprintln!("signature_a={}", hex::encode(signature_a.to_bytes()));
++        eprintln!("vote_b={}", hex::encode(&bytes_b));
++        eprintln!("signature_b={}", hex::encode(signature_b.to_bytes()));
++        eprintln!("proposal={}", hex::encode(&proposal_bytes));
++        eprintln!(
++            "proposal_signature={}",
++            hex::encode(proposal_signature.to_bytes())
++        );
++
++        assert_eq!(
++            hex::encode(&bytes_a),
++            "012a00000000000000250000002a0000008f02ee515a01644c9b5ad6f040be53a7918f272a010700000001aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
++        );
++        assert_eq!(
++            hex::encode(signature_a.to_bytes()),
++            "5fa41cd81ab879c35b7da39e578d663bae3db724b5dd66bd138087ea91684a526f556e808cb7ebb0567729a3116ba11c7cf58eaf99ba043f6baf04cd34450c0c"
++        );
++        assert_eq!(
++            hex::encode(&bytes_b),
++            "012a00000000000000250000002a0000008f02ee515a01644c9b5ad6f040be53a7918f272a010700000001bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
++        );
++        assert_eq!(
++            hex::encode(signature_b.to_bytes()),
++            "c627b87a284c24c8d7c57896b906cc4004e32bc1c402af5f65d671b105f1d75fc270b4762e6a565fb15df3daf1ba013df7132b11a2ef18d29e6d5cb19a922405"
++        );
++        assert_eq!(
++            hex::encode(&proposal_bytes),
++            "2a0000000000000044000000cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc490000008f02ee515a01644c9b5ad6f040be53a7918f272a010700000000"
++        );
++        assert_eq!(
++            hex::encode(proposal_signature.to_bytes()),
++            "4cf79676f7387fa458b98de9273ecd1a930706c1b0d5175b0e73dcf16a767b17e5c1763e751ffab4a8cc6aceb3ac54e2713f82770d756dfd2b7c3dd8c61ba306"
++        );
++        assert_ne!(bytes_a, bytes_b);
++        let verification_a = provider
++            .verify_signed_vote(
++                &signed_vote_a.message,
++                &signed_vote_a.signature,
++                &public_key,
++            )
++            .await
++            .unwrap();
++        let verification_b = provider
++            .verify_signed_vote(
++                &signed_vote_b.message,
++                &signed_vote_b.signature,
++                &public_key,
++            )
++            .await
++            .unwrap();
++        let proposal_verification = provider
++            .verify_signed_proposal(
++                &signed_proposal.message,
++                &signed_proposal.signature,
++                &public_key,
++            )
++            .await
++            .unwrap();
++        eprintln!(
++            "production_verifier=vote_a:{} vote_b:{} proposal:{}",
++            verification_a.is_valid(),
++            verification_b.is_valid(),
++            proposal_verification.is_valid()
++        );
++        assert!(verification_a.is_valid());
++        assert!(verification_b.is_valid());
++        assert!(proposal_verification.is_valid());
++
++        shutdown_tx.send(()).unwrap();
++        server_task.await.unwrap().unwrap();
++    }
+ }
+ 
+ #[cfg(all(test, feature = "integration-remote-signer"))]
+diff --git a/docs/security/remote-signer-trust-boundary.md b/docs/security/remote-signer-trust-boundary.md
+new file mode 100644
+index 0000000..6d8e974
+--- /dev/null
++++ b/docs/security/remote-signer-trust-boundary.md
+@@ -0,0 +1,147 @@
++# Arc remote-signer trust-boundary analysis
++
++This analysis was performed on arc-node commit
++`2a3e8ab10c0ac97bf1a2628a325eb98d4a468b1a` and relates it to the reported
++arc-remote-signer commit `a9e9fdb48c1e96a6c3fb875aba3d341e6a8af1a6`.
++
++## Result
++
++The missing call-chain exists. An arc-node validator configured with
++`--signing.remote` calls both `SignerService/PublicKey` and
++`SignerService/Sign`. `Sign` receives the raw Arc SSZ sign bytes, not a hash.
++The client does not add a chain ID, domain separator, authentication metadata,
++or client certificate. A CA certificate may optionally authenticate the server,
++but this is one-way TLS. Therefore, any party that can reach an unprotected
++signer and construct an Arc message can obtain a signature that the production
++consensus verifier accepts for that signer's validator identity.
++
++This repository does **not**, however, establish that a production signer is
++network reachable by an attacker. It contains neither the production signer
++workload nor its SecurityGroup/NetworkPolicy. The checked-in compose deployment
++does not enable remote signing at all. Consequently the code proves the signing
++oracle's consensus impact *conditional on network access*, but does not prove a
++production exploit. Recommended HackerOne severity is **Medium** pending proof
++of production reachability; raise to **High** if an untrusted tenant or Internet
++client can reach a production validator signer. Critical is not supported by
++the evidence here.
++
++## Exact call-chain
++
++1. `Node::consensus_identity` converts `SigningConfig::Remote`, creates
++   `RemoteSigningProvider`, calls `public_key()`, and derives the validator
++   address as the first 20 bytes of Keccak-256(public key).
++2. `RemoteSigningProvider::public_key` calls
++   `RemoteSignerClient::get_public_key`, which sends an empty
++   `PublicKeyRequest` to `SignerServiceClient::public_key`.
++3. Malachite engine effects `SignVote` and `SignProposal` call the configured
++   provider's `sign_vote` and `sign_proposal` methods.
++4. Those methods call `Vote::to_sign_bytes` or `Proposal::to_sign_bytes`, then
++   `SigningProvider::sign_bytes`, `RemoteSignerClient::sign_message`, and
++   `SignerServiceClient::sign(SignRequest { message })`.
++5. The returned 64 bytes become an Ed25519 `Signature`, then
++   `SignedVote::new(vote, signature)` or
++   `SignedProposal::new(proposal, signature)`. Network SSZ represents a signed
++   vote as the 64-byte signature plus the vote.
++6. A receiving Malachite engine handles `Effect::VerifySignature` and calls
++   `verify_signed_vote`/`verify_signed_proposal` using the public key selected
++   from the validator set. Arc recomputes `to_sign_bytes()` and invokes
++   Ed25519 `public_key.verify(bytes, signature)`. Commit-certificate checking
++   reconstructs a precommit for each validator and performs the same call.
++
++## Signed representation
++
++Votes are SSZ containers in this field order: vote type, `u64` height, round,
++nil-or-value block ID, and 20-byte validator address. Vote extensions are
++removed before signing. Proposals contain height, round, 32-byte block value,
++POL round, and validator address. Integers and SSZ offsets are little-endian;
++the vote-type tag is `00` for prevote and `01` for precommit. The value is an
++SSZ option (`00` nil, `01 || block_hash` non-nil). There is no prehash: these
++raw bytes are passed to Ed25519 and to the gRPC request.
++
++The bytes bind height, round, vote type, block hash (for a non-nil vote), and
++validator address. They do **not** bind chain ID, network, a vote/proposal domain
++tag beyond their different layouts, or the full validator public key. Validator
++identity is nevertheless enforced at verification because the receiver looks
++up and uses the validator-set public key for the claimed address.
++
++## Reproducible local vectors
++
++The end-to-end regression test uses only the deterministic ephemeral seed
++`[0x42; 32]`. It binds a real generated `SignerService` to an OS-assigned port
++on `127.0.0.1`, connects through the production `RemoteSignerClient` over
++plaintext h2c without metadata, calls `PublicKey` and `Sign`, attaches the RPC
++responses to production `SignedVote`/`SignedProposal` values, and invokes the
++production provider verifier. It contacts no non-loopback network.
++
++The localhost service implements the reviewed signer's two RPC handlers against
++the real protobuf/tonic service contract: `PublicKey` returns the ephemeral key
++and `Sign` applies Ed25519 directly to `SignRequest.message`. The external
++arc-remote-signer repository is not vendored into arc-node, so this test does
++not claim binary identity with its executable; it proves the complete wire-level
++arc-node call-chain without assuming that a locally produced primitive signature
++is equivalent to an RPC response.
++
++* Chain ID: **absent**
++* Height: `42`; round: `7`; type: `Precommit` (`01`)
++* Public key: `2152f8d19b791d24453242e15f2eab6cb7cffa7b6a5ed30097960e069881db12`
++* Validator address: `8f02ee515a01644c9b5ad6f040be53a7918f272a`
++* Block A: 32 bytes of `aa`
++* Vote A: `012a00000000000000250000002a0000008f02ee515a01644c9b5ad6f040be53a7918f272a010700000001aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa`
++* Signature A: `5fa41cd81ab879c35b7da39e578d663bae3db724b5dd66bd138087ea91684a526f556e808cb7ebb0567729a3116ba11c7cf58eaf99ba043f6baf04cd34450c0c`
++* Block B: 32 bytes of `bb`
++* Vote B: `012a00000000000000250000002a0000008f02ee515a01644c9b5ad6f040be53a7918f272a010700000001bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb`
++* Signature B: `c627b87a284c24c8d7c57896b906cc4004e32bc1c402af5f65d671b105f1d75fc270b4762e6a565fb15df3daf1ba013df7132b11a2ef18d29e6d5cb19a922405`
++* Proposal (`cc` block): `2a0000000000000044000000cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc490000008f02ee515a01644c9b5ad6f040be53a7918f272a010700000000`
++* Proposal signature: `4cf79676f7387fa458b98de9273ecd1a930706c1b0d5175b0e73dcf16a767b17e5c1763e751ffab4a8cc6aceb3ac54e2713f82770d756dfd2b7c3dd8c61ba306`
++* Verification: both conflicting votes and the proposal return valid independently.
++
++Reproduce the complete PoC and retain the dynamically selected listen address:
++
++```console
++cargo test -p arc-remote-signer \
++  localhost_signer_accepts_and_verifies_conflicting_canonical_votes \
++  -- --nocapture
++```
++
++Expected output fields are `listen_address=127.0.0.1:<ephemeral-port>`,
++`transport=plaintext_h2c auth=none`, the public key and canonical/signature
++vectors above, followed by
++`production_verifier=vote_a:true vote_b:true proposal:true`.
++
++The recorded run for this report selected `127.0.0.1:46489` and printed:
++
++```text
++transport=plaintext_h2c auth=none endpoint=http://127.0.0.1:46489
++public_key=2152f8d19b791d24453242e15f2eab6cb7cffa7b6a5ed30097960e069881db12
++production_verifier=vote_a:true vote_b:true proposal:true
++```
++
++The port is intentionally ephemeral and will differ on later runs. After the
++test, `git diff --exit-code HEAD -- . ':(exclude)target'` verifies that executing
++the PoC did not modify any tracked source or configuration file.
++
++This does not mean consensus accepts both votes into one quorum without other
++rules: Malachite detects/evidences equivocation and its vote keeper controls
++state transitions. It means cryptographic verification alone accepts each
++signature, as expected. No slashing-protection or high-water-mark state exists
++in arc-node's remote client or the reported signer; the consensus WAL is crash
++recovery state, not an authorization boundary for direct signer callers.
++
++## Transport and deployment boundary
++
++An `http://` endpoint creates plaintext h2c gRPC. Supplying
++`--signing.tls-cert-path` configures a trusted CA and `https://`, but the client
++sets no client identity. There is no bearer token, call credential, metadata
++credential, SPIFFE identity, or mTLS client certificate in the request path.
++
++Documentation shows the illustrative endpoint
++`http://validator-signer-proxy:10340`; unit tests use `http://signer:10340` and
++the library default is `http://0.0.0.0:10340`. These are examples/defaults, not
++proof of production topology. The repository cannot answer whether validator
++and signer share a host/pod or use separate pods/EC2 instances, and contains no
++signer-specific firewall, SecurityGroup, or NetworkPolicy. That missing
++deployment evidence is the key counterargument: unauthenticated signing can be
++an intended design under a strictly private, single-client network trust
++boundary. Even then, mTLS/application authorization, signer-side canonical
++parsing/domain checks, and durable double-sign protection are recommended
++defense in depth.
+-- 
+2.43.0
+
