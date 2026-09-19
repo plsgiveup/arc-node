@@ -253,11 +253,50 @@ impl SigningProvider<ArcContext> for RemoteSigningProvider {
 
 #[cfg(test)]
 mod unit_tests {
+    use std::sync::Arc;
+
     use arc_consensus_types::signing::PrivateKey;
     use arc_consensus_types::{Address, BlockHash, Height, Round, Value, ValueId};
     use malachitebft_core_types::{NilOrVal, VoteType};
+    use tokio::net::TcpListener;
+    use tokio::sync::oneshot;
+    use tokio_stream::wrappers::TcpListenerStream;
+    use tonic::{Request, Response, Status};
 
     use super::*;
+    use crate::client::proto::signer_service_server::{SignerService, SignerServiceServer};
+    use crate::client::proto::{PublicKeyRequest, PublicKeyResponse, SignRequest, SignResponse};
+
+    /// Local-only implementation of the arc-remote-signer SignerService wire
+    /// contract. Like the reviewed signer implementation, it signs the request
+    /// message verbatim and performs no authentication or consensus parsing.
+    struct LocalSignerService {
+        private_key: Arc<PrivateKey>,
+    }
+
+    #[tonic::async_trait]
+    impl SignerService for LocalSignerService {
+        async fn public_key(
+            &self,
+            request: Request<PublicKeyRequest>,
+        ) -> Result<Response<PublicKeyResponse>, Status> {
+            assert!(request.metadata().get("authorization").is_none());
+            Ok(Response::new(PublicKeyResponse {
+                public_key: self.private_key.public_key().as_bytes().to_vec(),
+            }))
+        }
+
+        async fn sign(
+            &self,
+            request: Request<SignRequest>,
+        ) -> Result<Response<SignResponse>, Status> {
+            assert!(request.metadata().get("authorization").is_none());
+            let signature = self.private_key.sign(&request.into_inner().message);
+            Ok(Response::new(SignResponse {
+                signature: signature.to_bytes().to_vec(),
+            }))
+        }
+    }
 
     #[test]
     fn test_bytes_to_signature_valid_length() {
@@ -314,6 +353,142 @@ mod unit_tests {
         bad_sig_bytes[0] ^= 0x01;
         let bad_sig = ConsensusSignature::from_bytes(bad_sig_bytes);
         assert!(public_key.verify(&vote_bytes, &bad_sig).is_err());
+    }
+
+    /// End-to-end regression vector for the remote-signer trust boundary.
+    ///
+    /// The remote signer receives these SSZ bytes verbatim.  In particular, no
+    /// chain identifier or request-specific domain separator is added by the
+    /// provider. This test starts a plaintext, unauthenticated SignerService on
+    /// an ephemeral localhost port, then uses the production gRPC client and
+    /// provider to sign and verify two conflicting precommits.
+    #[tokio::test]
+    async fn localhost_signer_accepts_and_verifies_conflicting_canonical_votes() {
+        let private_key = Arc::new(PrivateKey::from([0x42; 32]));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let listen_address = listener.local_addr().unwrap();
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let server = tonic::transport::Server::builder()
+            .add_service(SignerServiceServer::new(LocalSignerService {
+                private_key: Arc::clone(&private_key),
+            }))
+            .serve_with_incoming_shutdown(TcpListenerStream::new(listener), async {
+                let _ = shutdown_rx.await;
+            });
+        let server_task = tokio::spawn(server);
+
+        let endpoint = format!("http://{listen_address}");
+        let provider = RemoteSigningProvider::new(RemoteSigningConfig::new(endpoint.clone()))
+            .await
+            .unwrap();
+        let public_key = provider.public_key().await.unwrap();
+        let validator_address = Address::from_public_key(&public_key);
+        let make_vote = |block_byte| {
+            Vote::new_precommit(
+                Height::new(42),
+                Round::new(7),
+                NilOrVal::Val(ValueId::new(BlockHash::new([block_byte; 32]))),
+                validator_address,
+            )
+        };
+
+        let vote_a = make_vote(0xaa);
+        let vote_b = make_vote(0xbb);
+        let bytes_a = vote_a.to_sign_bytes();
+        let bytes_b = vote_b.to_sign_bytes();
+        let signed_vote_a = provider.sign_vote(vote_a).await.unwrap();
+        let signed_vote_b = provider.sign_vote(vote_b).await.unwrap();
+        let signature_a = &signed_vote_a.signature;
+        let signature_b = &signed_vote_b.signature;
+        let proposal = Proposal::new(
+            Height::new(42),
+            Round::new(7),
+            Value::new(BlockHash::new([0xcc; 32])),
+            Round::Nil,
+            validator_address,
+        );
+        let proposal_bytes = proposal.to_sign_bytes();
+        let signed_proposal = provider.sign_proposal(proposal).await.unwrap();
+        let proposal_signature = &signed_proposal.signature;
+
+        eprintln!("listen_address={listen_address}");
+        eprintln!("transport=plaintext_h2c auth=none endpoint={endpoint}");
+        eprintln!("public_key={}", hex::encode(public_key.as_bytes()));
+        eprintln!(
+            "validator_address={}",
+            hex::encode(validator_address.into_inner())
+        );
+        eprintln!("vote_a={}", hex::encode(&bytes_a));
+        eprintln!("signature_a={}", hex::encode(signature_a.to_bytes()));
+        eprintln!("vote_b={}", hex::encode(&bytes_b));
+        eprintln!("signature_b={}", hex::encode(signature_b.to_bytes()));
+        eprintln!("proposal={}", hex::encode(&proposal_bytes));
+        eprintln!(
+            "proposal_signature={}",
+            hex::encode(proposal_signature.to_bytes())
+        );
+
+        assert_eq!(
+            hex::encode(&bytes_a),
+            "012a00000000000000250000002a0000008f02ee515a01644c9b5ad6f040be53a7918f272a010700000001aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        );
+        assert_eq!(
+            hex::encode(signature_a.to_bytes()),
+            "5fa41cd81ab879c35b7da39e578d663bae3db724b5dd66bd138087ea91684a526f556e808cb7ebb0567729a3116ba11c7cf58eaf99ba043f6baf04cd34450c0c"
+        );
+        assert_eq!(
+            hex::encode(&bytes_b),
+            "012a00000000000000250000002a0000008f02ee515a01644c9b5ad6f040be53a7918f272a010700000001bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+        );
+        assert_eq!(
+            hex::encode(signature_b.to_bytes()),
+            "c627b87a284c24c8d7c57896b906cc4004e32bc1c402af5f65d671b105f1d75fc270b4762e6a565fb15df3daf1ba013df7132b11a2ef18d29e6d5cb19a922405"
+        );
+        assert_eq!(
+            hex::encode(&proposal_bytes),
+            "2a0000000000000044000000cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc490000008f02ee515a01644c9b5ad6f040be53a7918f272a010700000000"
+        );
+        assert_eq!(
+            hex::encode(proposal_signature.to_bytes()),
+            "4cf79676f7387fa458b98de9273ecd1a930706c1b0d5175b0e73dcf16a767b17e5c1763e751ffab4a8cc6aceb3ac54e2713f82770d756dfd2b7c3dd8c61ba306"
+        );
+        assert_ne!(bytes_a, bytes_b);
+        let verification_a = provider
+            .verify_signed_vote(
+                &signed_vote_a.message,
+                &signed_vote_a.signature,
+                &public_key,
+            )
+            .await
+            .unwrap();
+        let verification_b = provider
+            .verify_signed_vote(
+                &signed_vote_b.message,
+                &signed_vote_b.signature,
+                &public_key,
+            )
+            .await
+            .unwrap();
+        let proposal_verification = provider
+            .verify_signed_proposal(
+                &signed_proposal.message,
+                &signed_proposal.signature,
+                &public_key,
+            )
+            .await
+            .unwrap();
+        eprintln!(
+            "production_verifier=vote_a:{} vote_b:{} proposal:{}",
+            verification_a.is_valid(),
+            verification_b.is_valid(),
+            proposal_verification.is_valid()
+        );
+        assert!(verification_a.is_valid());
+        assert!(verification_b.is_valid());
+        assert!(proposal_verification.is_valid());
+
+        shutdown_tx.send(()).unwrap();
+        server_task.await.unwrap().unwrap();
     }
 }
 
